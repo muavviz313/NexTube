@@ -87,6 +87,16 @@ export interface PlaylistSummary {
   source: 'youtube' | 'curated';
 }
 
+export interface YouTubeChannelResult {
+  channelId: string;
+  title: string;
+  handle: string;
+  thumbnailUrl: string;
+  subscriberCountLabel: string;
+  description: string;
+  isSubscribed?: boolean;
+}
+
 export interface GoogleAccountProfile {
   uid: string;
   email: string;

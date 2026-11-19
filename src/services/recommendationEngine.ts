@@ -237,3 +237,34 @@ export function rankVideosByInterest(
     .sort((a, b) => (b.score !== a.score ? b.score - a.score : a.originalIndex - b.originalIndex))
     .map((entry) => entry.video);
 }
+
+export function parsePublishedAgeSeconds(label?: string): number {
+  if (!label) return Number.MAX_SAFE_INTEGER;
+  const lower = label.toLowerCase().trim();
+  if (!lower) return Number.MAX_SAFE_INTEGER;
+  if (lower.includes('just now') || lower === 'live' || lower.includes('watching')) return 0;
+  if (lower.includes('today')) return 43_200;
+  if (lower.includes('yesterday')) return 86_400;
+
+  const match = lower.match(
+    /(\d+)\s*(years?|yrs?|y|months?|mos?|mo|weeks?|wks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/
+  );
+  if (!match) return Number.MAX_SAFE_INTEGER;
+  const num = Number(match[1]);
+  const unit = match[2];
+  if (unit.startsWith('s')) return num;
+  if (unit.startsWith('mo')) return num * 2_592_000;
+  if (unit.startsWith('m')) return num * 60;
+  if (unit.startsWith('h')) return num * 3_600;
+  if (unit.startsWith('d')) return num * 86_400;
+  if (unit.startsWith('w')) return num * 604_800;
+  if (unit.startsWith('y')) return num * 31_536_000;
+  return Number.MAX_SAFE_INTEGER;
+}
+
+export function sortVideosLatestFirst(videos: VideoItem[]): VideoItem[] {
+  return [...videos].sort(
+    (a, b) =>
+      parsePublishedAgeSeconds(a.publishedAtLabel) - parsePublishedAgeSeconds(b.publishedAtLabel)
+  );
+}

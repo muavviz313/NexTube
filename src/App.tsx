@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
+  ArrowLeft,
+  Bell,
   Bookmark,
   BookmarkCheck,
   Check,
@@ -22,6 +24,7 @@ import {
   Sun,
   Tv,
   UserCircle2,
+  Users,
   X,
 } from 'lucide-react';
 import { FEED_CATEGORIES } from './data/catalog';
@@ -40,6 +43,7 @@ import type {
   ThemeMode,
   VideoItem,
   WatchLaterRecord,
+  YouTubeChannelResult,
 } from './types/nextube';
 import {
   getAccessToken,
@@ -49,6 +53,7 @@ import {
 } from './services/firebaseAuth';
 import {
   deleteYouTubeComment,
+  fetchChannelUploads,
   fetchLiveYouTubeFallback,
   fetchLiveYouTubeVideoDetails,
   fetchYouTubeComments,
@@ -57,6 +62,7 @@ import {
   postYouTubeComment,
   rateYouTubeVideo,
   reportYouTubeCommentAsSpam,
+  searchYouTubeChannels,
   searchYouTubeVideos,
   subscribeToYouTubeChannel,
 } from './services/youtubeApi';
@@ -70,6 +76,7 @@ import {
   recordInterestSignal,
   saveInterestProfile,
   savePersistedHistory,
+  sortVideosLatestFirst,
 } from './services/recommendationEngine';
 import {
   deleteOfflinePlaylist,
@@ -92,8 +99,13 @@ import { VideoPlayerModal } from './components/VideoPlayerModal';
 import { ShortsPlayer } from './components/ShortsPlayer';
 import { MiniPlayer } from './components/MiniPlayer';
 import { LibraryView } from './components/LibraryView';
-import { ArchitectureBlueprintView } from './components/ArchitectureBlueprintView';
 import { CommentsSection } from './components/CommentsSection';
+
+const ArchitectureBlueprintView = lazy(() =>
+  import('./components/ArchitectureBlueprintView').then((m) => ({
+    default: m.ArchitectureBlueprintView,
+  }))
+);
 
 function getSavedThemeMode(): ThemeMode {
   try {
@@ -158,6 +170,14 @@ export default function App() {
   const [commentsByVideo, setCommentsByVideo] = useState<Record<string, CommentItem[]>>({});
   const [moderationLog, setModerationLog] = useState<CommentModerationAction[]>([]);
   const fetchedDetailsRef = useRef<Set<string>>(new Set());
+
+  // Channels Search & Selected Channel Uploads State
+  const [searchMode, setSearchMode] = useState<'videos' | 'channels'>('videos');
+  const [searchSort, setSearchSort] = useState<'latest' | 'relevance'>('latest');
+  const [channelResults, setChannelResults] = useState<YouTubeChannelResult[]>([]);
+  const [selectedChannel, setSelectedChannel] = useState<YouTubeChannelResult | null>(null);
+  const [channelVideos, setChannelVideos] = useState<VideoItem[]>([]);
+  const [isSearchingChannels, setIsSearchingChannels] = useState(false);
 
   // Player & Mini-Player State
   const [activeVideo, setActiveVideo] = useState<VideoItem | null>(null);
@@ -463,13 +483,104 @@ export default function App() {
     }
   };
 
-  const runInterestOrSearchQuery = async (rawQuery: string, catLabel = selectedCategory) => {
+  const runChannelSearch = async (rawQuery: string) => {
+    const q = rawQuery.trim() || 'tech';
+    if (!isIncognito && rawQuery.trim()) {
+      setInterestProfile((prev) =>
+        recordInterestSignal(prev, { type: 'search', searchQuery: rawQuery.trim() })
+      );
+    }
+    setSelectedChannel(null);
+    setIsSearchingChannels(true);
+    try {
+      const token = getAccessToken();
+      const subSet = new Set(subscriptions.map((s) => s.channelId));
+      const found = await searchYouTubeChannels(q, token, subSet);
+      setChannelResults(found);
+      setActiveSearchQuery(rawQuery.trim());
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Channel search failed');
+    } finally {
+      setIsSearchingChannels(false);
+    }
+  };
+
+  const handleOpenChannel = async (channel: YouTubeChannelResult) => {
+    setSelectedChannel(channel);
+    setIsSearchingChannels(true);
+    try {
+      const token = getAccessToken();
+      const subSet = new Set(subscriptions.map((s) => s.channelId));
+      const vids = await fetchChannelUploads(channel, token, myChannelId, subSet);
+      setChannelVideos(vids);
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not load channel videos');
+    } finally {
+      setIsSearchingChannels(false);
+    }
+  };
+
+  const handleToggleSubscribeChannelResult = async (channel: YouTubeChannelResult) => {
+    const subSet = new Set(subscriptions.map((s) => s.channelId));
+    const currentlySub = subSet.has(channel.channelId) || Boolean(channel.isSubscribed);
+    const nextSub = !currentlySub;
+
+    if (nextSub && !isIncognito) {
+      setInterestProfile((prev) =>
+        recordInterestSignal(prev, { type: 'subscribe', channelTitle: channel.title })
+      );
+    }
+
+    setChannelResults((prev) =>
+      prev.map((c) => (c.channelId === channel.channelId ? { ...c, isSubscribed: nextSub } : c))
+    );
+    if (selectedChannel?.channelId === channel.channelId) {
+      setSelectedChannel({ ...channel, isSubscribed: nextSub });
+    }
+
+    if (nextSub) {
+      setSubscriptions((prev) => {
+        if (prev.some((s) => s.channelId === channel.channelId)) return prev;
+        return [
+          {
+            id: `sub-${channel.channelId}`,
+            channelId: channel.channelId,
+            title: channel.title,
+            thumbnailUrl: channel.thumbnailUrl,
+          },
+          ...prev,
+        ];
+      });
+    } else {
+      setSubscriptions((prev) => prev.filter((s) => s.channelId !== channel.channelId));
+    }
+
+    const token = getAccessToken();
+    if (token && channel.channelId.startsWith('UC') && nextSub) {
+      try {
+        await subscribeToYouTubeChannel(channel.channelId, token);
+        showToast(`Subscribed to ${channel.title} on YouTube`);
+        return;
+      } catch {
+        // Fallback toast below
+      }
+    }
+    showToast(nextSub ? `Subscribed to ${channel.title}` : `Unsubscribed from ${channel.title}`);
+  };
+
+  const runInterestOrSearchQuery = async (
+    rawQuery: string,
+    catLabel = selectedCategory,
+    sortOverride?: 'latest' | 'relevance'
+  ) => {
     const q = rawQuery.trim();
     if (!q && catLabel === 'All') {
       setActiveSearchQuery('');
       setVideos(homeFeedBase);
       return;
     }
+
+    const activeSort = sortOverride ?? searchSort;
 
     if (q && !isIncognito) {
       setInterestProfile((prev) => recordInterestSignal(prev, { type: 'search', searchQuery: q }));
@@ -487,16 +598,22 @@ export default function App() {
           categoryLabel: catLabel,
           myChannelId,
           subscribedChannelIds,
+          sortBy: activeSort,
         });
       } else {
         results = await fetchLiveYouTubeFallback(
           q || catLabel,
           'videos',
-          catLabel === 'All' ? 'YouTube' : catLabel
+          catLabel === 'All' ? 'YouTube' : catLabel,
+          activeSort
         );
       }
       setActiveSearchQuery(q);
-      setVideos(rankVideosByInterest(results, interestProfile, watchedIdSet));
+      setVideos(
+        activeSort === 'latest'
+          ? sortVideosLatestFirst(results)
+          : rankVideosByInterest(results, interestProfile, watchedIdSet)
+      );
     } catch (err: unknown) {
       showToast(err instanceof Error ? err.message : 'YouTube search failed');
     } finally {
@@ -506,12 +623,18 @@ export default function App() {
 
   const handleSearchSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const token = getAccessToken();
-    if (!token) {
+    if (searchMode === 'channels') {
+      setActiveTab('home');
+      await runChannelSearch(searchQuery);
+      return;
+    }
+    if (!getAccessToken() && !searchQuery.trim()) {
       showToast('Sign in with Google to search YouTube');
       return;
     }
-    await runInterestOrSearchQuery(searchQuery, selectedCategory);
+    // Always default video search to Latest First
+    setSearchSort('latest');
+    await runInterestOrSearchQuery(searchQuery, selectedCategory, 'latest');
   };
 
   const handleSignInNewAccount = async () => {
@@ -954,8 +1077,11 @@ export default function App() {
               v.channelTitle.toLowerCase().includes(q) ||
               v.category.toLowerCase().includes(q)
           );
+    if (activeSearchQuery.trim() && searchSort === 'latest') {
+      return sortVideosLatestFirst(base);
+    }
     return rankVideosByInterest(base, interestProfile, watchedIdSet);
-  }, [videos, searchQuery, activeSearchQuery, interestProfile, watchedIdSet]);
+  }, [videos, searchQuery, activeSearchQuery, searchSort, interestProfile, watchedIdSet]);
 
   const rankedShorts = useMemo(
     () => rankVideosByInterest(shorts, interestProfile, watchedIdSet),
@@ -1280,14 +1406,52 @@ export default function App() {
         {(activeTab === 'home' || activeTab === 'subscriptions') && (
           <div className="space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <form onSubmit={handleSearchSubmit} className="relative flex-1 max-w-xl flex gap-2">
-                <div className="relative flex-1">
+              <form onSubmit={handleSearchSubmit} className="relative flex-1 max-w-2xl flex flex-wrap sm:flex-nowrap gap-2">
+                <div className="flex items-center p-1 rounded-xl bg-zinc-100 dark:bg-white/[0.06] shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchMode('videos');
+                      setSelectedChannel(null);
+                    }}
+                    className={`h-9 px-3 rounded-lg text-xs font-semibold transition-colors ${
+                      searchMode === 'videos'
+                        ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-white shadow-sm'
+                        : 'text-zinc-600 dark:text-zinc-400'
+                    }`}
+                  >
+                    Videos
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchMode('channels');
+                      if (channelResults.length === 0) {
+                        void runChannelSearch(searchQuery || 'tech');
+                      }
+                    }}
+                    className={`h-9 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                      searchMode === 'channels'
+                        ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-white shadow-sm'
+                        : 'text-zinc-600 dark:text-zinc-400'
+                    }`}
+                  >
+                    <Users className="w-3.5 h-3.5" />
+                    Channels
+                  </button>
+                </div>
+
+                <div className="relative flex-1 min-w-[200px]">
                   <Search className="w-4 h-4 text-zinc-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                   <input
                     type="text"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search live YouTube videos, creators, or topics..."
+                    placeholder={
+                      searchMode === 'channels'
+                        ? 'Search YouTube channels & creators (e.g. MKBHD, MrBeast)...'
+                        : 'Search live YouTube videos, creators, or topics...'
+                    }
                     className="w-full h-11 pl-10 pr-10 rounded-xl bg-zinc-50 dark:bg-[#141414] border border-zinc-200 dark:border-white/10 focus:border-[var(--nextube-accent)] text-sm outline-none transition-colors"
                   />
                   {searchQuery && (
@@ -1296,7 +1460,10 @@ export default function App() {
                       onClick={() => {
                         setSearchQuery('');
                         setActiveSearchQuery('');
-                        if (selectedCategory === 'All') setVideos(homeFeedBase);
+                        setSelectedChannel(null);
+                        if (searchMode === 'videos' && selectedCategory === 'All') {
+                          setVideos(homeFeedBase);
+                        }
                       }}
                       aria-label="Clear search"
                       className="absolute right-2.5 top-1/2 -translate-y-1/2 w-7 h-7 rounded-lg flex items-center justify-center text-zinc-400 hover:text-zinc-900 dark:hover:text-white"
@@ -1326,6 +1493,44 @@ export default function App() {
                 )}
               </div>
             </div>
+
+            {searchMode === 'videos' && activeSearchQuery && (
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="text-zinc-500 dark:text-zinc-400">
+                  Results for <strong className="text-zinc-900 dark:text-white">&ldquo;{activeSearchQuery}&rdquo;</strong>
+                </span>
+                <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-100 dark:bg-white/[0.06]">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchSort('latest');
+                      void runInterestOrSearchQuery(activeSearchQuery, selectedCategory, 'latest');
+                    }}
+                    className={`min-h-[30px] px-3 rounded-lg font-semibold transition-colors ${
+                      searchSort === 'latest'
+                        ? 'bg-[var(--nextube-accent)] text-white'
+                        : 'text-zinc-600 dark:text-zinc-300'
+                    }`}
+                  >
+                    Latest First
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchSort('relevance');
+                      void runInterestOrSearchQuery(activeSearchQuery, selectedCategory, 'relevance');
+                    }}
+                    className={`min-h-[30px] px-3 rounded-lg font-semibold transition-colors ${
+                      searchSort === 'relevance'
+                        ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-white shadow-sm'
+                        : 'text-zinc-600 dark:text-zinc-300'
+                    }`}
+                  >
+                    Relevance
+                  </button>
+                </div>
+              </div>
+            )}
 
             {activeTab === 'home' && activeAccount && (
               <div className="space-y-2">
@@ -1409,7 +1614,231 @@ export default function App() {
               </div>
             )}
 
-            {!activeAccount ? (
+            {searchMode === 'channels' ? (
+              selectedChannel ? (
+                <div className="space-y-5">
+                  <div className="p-4 sm:p-5 rounded-2xl bg-zinc-50 dark:bg-[#141414] border border-zinc-200 dark:border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedChannel(null)}
+                        aria-label="Back to channel results"
+                        className="w-9 h-9 rounded-xl border border-zinc-200 dark:border-white/10 flex items-center justify-center hover:bg-zinc-100 dark:hover:bg-white/10 shrink-0"
+                      >
+                        <ArrowLeft className="w-4 h-4" />
+                      </button>
+                      <MediaImage
+                        src={selectedChannel.thumbnailUrl}
+                        alt={selectedChannel.title}
+                        priority
+                        className="w-12 h-12 rounded-full object-cover border border-zinc-200 dark:border-white/15 shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <h2 className="text-base font-bold truncate">{selectedChannel.title}</h2>
+                        <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">
+                          {[selectedChannel.handle, selectedChannel.subscriberCountLabel]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleSubscribeChannelResult(selectedChannel)}
+                      className={`min-h-[40px] px-4 rounded-xl text-xs font-semibold flex items-center gap-1.5 shrink-0 transition-colors ${
+                        selectedChannel.isSubscribed ||
+                        subscriptions.some((s) => s.channelId === selectedChannel.channelId)
+                          ? 'bg-zinc-200 dark:bg-white/10 text-zinc-900 dark:text-zinc-100'
+                          : 'bg-[var(--nextube-accent)] text-white'
+                      }`}
+                    >
+                      {(selectedChannel.isSubscribed ||
+                        subscriptions.some((s) => s.channelId === selectedChannel.channelId)) && (
+                        <Bell className="w-3.5 h-3.5" />
+                      )}
+                      {selectedChannel.isSubscribed ||
+                      subscriptions.some((s) => s.channelId === selectedChannel.channelId)
+                        ? 'Subscribed'
+                        : 'Subscribe'}
+                    </button>
+                  </div>
+
+                  {isSearchingChannels ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                      {Array.from({ length: 6 }).map((_, idx) => (
+                        <div key={idx} className="space-y-3">
+                          <div className="aspect-video rounded-2xl skeleton-shimmer" />
+                          <div className="h-4 w-4/5 rounded skeleton-shimmer" />
+                        </div>
+                      ))}
+                    </div>
+                  ) : channelVideos.length === 0 ? (
+                    <div className="p-8 rounded-2xl border border-dashed border-zinc-300 dark:border-white/15 text-center text-xs text-zinc-500">
+                      No public videos returned for this channel.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                      {channelVideos.map((vid, idx) => {
+                        const isWatchLater = watchLaterIdSet.has(vid.id);
+                        return (
+                          <article
+                            key={vid.id}
+                            onMouseEnter={() => {
+                              if (vid.youtubeId) void fetchLiveYouTubeVideoDetails(vid.youtubeId);
+                            }}
+                            className="rounded-2xl bg-white dark:bg-[#141414] border border-zinc-200 dark:border-white/10 overflow-hidden flex flex-col group"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => void openVideoPlayer(vid)}
+                              className="relative aspect-video w-full bg-zinc-200 dark:bg-zinc-900 overflow-hidden text-left"
+                            >
+                              <MediaImage
+                                src={vid.thumbnailUrl}
+                                alt={vid.title}
+                                priority={idx < 3}
+                                className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
+                              />
+                              <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/80 text-white font-mono text-[11px] tabular-nums">
+                                {vid.durationLabel}
+                              </span>
+                            </button>
+                            <div className="p-4 flex-1 flex flex-col justify-between gap-3">
+                              <div className="space-y-1">
+                                <button
+                                  type="button"
+                                  onClick={() => void openVideoPlayer(vid)}
+                                  className="text-left"
+                                >
+                                  <h3 className="text-sm font-semibold line-clamp-2 hover:text-[var(--nextube-accent)]">
+                                    {vid.title}
+                                  </h3>
+                                </button>
+                                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                                  {vid.viewCountLabel} · {vid.publishedAtLabel}
+                                </p>
+                              </div>
+                              <div className="flex items-center justify-end gap-1.5 pt-2 border-t border-zinc-100 dark:border-white/5">
+                                <button
+                                  type="button"
+                                  aria-pressed={isWatchLater}
+                                  onClick={() => void handleToggleWatchLater(vid)}
+                                  className={`min-h-[34px] px-2.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 ${
+                                    isWatchLater
+                                      ? 'bg-[var(--nextube-accent)]/10 text-[var(--nextube-accent)]'
+                                      : 'bg-zinc-100 dark:bg-white/[0.07] text-zinc-700 dark:text-zinc-200'
+                                  }`}
+                                >
+                                  {isWatchLater ? (
+                                    <BookmarkCheck className="w-3.5 h-3.5" />
+                                  ) : (
+                                    <Bookmark className="w-3.5 h-3.5" />
+                                  )}
+                                  {isWatchLater ? 'Saved' : 'Watch Later'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDownloadTargetVideo(vid)}
+                                  className="min-h-[34px] px-2.5 rounded-xl text-xs font-semibold bg-zinc-100 dark:bg-white/[0.07] hover:bg-[var(--nextube-accent)] hover:text-white flex items-center gap-1.5"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                  Download
+                                </button>
+                              </div>
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : isSearchingChannels ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {Array.from({ length: 6 }).map((_, idx) => (
+                    <div
+                      key={idx}
+                      className="p-4 rounded-2xl border border-zinc-200 dark:border-white/10 flex items-center gap-3"
+                    >
+                      <div className="w-14 h-14 rounded-full skeleton-shimmer shrink-0" />
+                      <div className="flex-1 space-y-2">
+                        <div className="h-4 w-3/4 rounded skeleton-shimmer" />
+                        <div className="h-3 w-1/2 rounded skeleton-shimmer" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : channelResults.length === 0 ? (
+                <div className="p-10 rounded-2xl border border-dashed border-zinc-300 dark:border-white/15 text-center space-y-2">
+                  <Users className="w-7 h-7 mx-auto text-zinc-400" />
+                  <p className="text-sm font-semibold">Search any YouTube Channel</p>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Enter a creator name or @handle above to browse channels, subscribe, and watch their uploads.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {channelResults.map((ch) => {
+                    const isSub =
+                      Boolean(ch.isSubscribed) ||
+                      subscriptions.some((s) => s.channelId === ch.channelId);
+                    return (
+                      <div
+                        key={ch.channelId}
+                        className="p-4 rounded-2xl bg-white dark:bg-[#141414] border border-zinc-200 dark:border-white/10 flex flex-col justify-between gap-4 hover:border-[var(--nextube-accent)]/50 transition-colors"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => void handleOpenChannel(ch)}
+                          className="flex items-start gap-3.5 text-left"
+                        >
+                          <MediaImage
+                            src={ch.thumbnailUrl}
+                            alt={ch.title}
+                            className="w-14 h-14 rounded-full object-cover border border-zinc-200 dark:border-white/15 shrink-0"
+                          />
+                          <div className="min-w-0 space-y-1">
+                            <h3 className="text-sm font-bold truncate hover:text-[var(--nextube-accent)]">
+                              {ch.title}
+                            </h3>
+                            <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">
+                              {[ch.handle, ch.subscriberCountLabel].filter(Boolean).join(' · ')}
+                            </p>
+                            {ch.description && (
+                              <p className="text-xs text-zinc-500 dark:text-zinc-400 line-clamp-2">
+                                {ch.description}
+                              </p>
+                            )}
+                          </div>
+                        </button>
+
+                        <div className="flex items-center justify-between gap-2 pt-3 border-t border-zinc-100 dark:border-white/5">
+                          <button
+                            type="button"
+                            onClick={() => void handleOpenChannel(ch)}
+                            className="min-h-[36px] px-3 rounded-xl bg-zinc-100 dark:bg-white/[0.07] hover:bg-zinc-200 dark:hover:bg-white/15 text-xs font-semibold transition-colors"
+                          >
+                            View Videos
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleSubscribeChannelResult(ch)}
+                            className={`min-h-[36px] px-3.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                              isSub
+                                ? 'bg-zinc-200 dark:bg-white/10 text-zinc-900 dark:text-zinc-100'
+                                : 'bg-[var(--nextube-accent)] text-white'
+                            }`}
+                          >
+                            {isSub && <Bell className="w-3.5 h-3.5" />}
+                            {isSub ? 'Subscribed' : 'Subscribe'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )
+            ) : !activeAccount ? (
               renderConnectYouTubeState(
                 'Connect Your Google Account to Sync YouTube',
                 'NexTube syncs your real YouTube Home feed, subscriptions, playlists, liked videos, and Shorts directly from YouTube — with zero dummy content.'
@@ -1448,12 +1877,15 @@ export default function App() {
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-                {filteredVideos.map((vid) => {
+                {filteredVideos.map((vid, idx) => {
                   const isOffline = offlineVideoIdSet.has(vid.id);
                   const isWatchLater = watchLaterIdSet.has(vid.id);
                   return (
                     <article
                       key={vid.id}
+                      onMouseEnter={() => {
+                        if (vid.youtubeId) void fetchLiveYouTubeVideoDetails(vid.youtubeId);
+                      }}
                       className="rounded-2xl bg-white dark:bg-[#141414] border border-zinc-200 dark:border-white/10 overflow-hidden flex flex-col group"
                     >
                       <button
@@ -1464,6 +1896,7 @@ export default function App() {
                         <MediaImage
                           src={vid.thumbnailUrl}
                           alt={vid.title}
+                          priority={idx < 3}
                           className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
                         />
                         <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/80 text-white font-mono text-[11px] tabular-nums">
@@ -1767,7 +2200,17 @@ export default function App() {
         )}
 
         {/* ARCHITECTURE TAB */}
-        {activeTab === 'architecture' && <ArchitectureBlueprintView />}
+        {activeTab === 'architecture' && (
+          <Suspense
+            fallback={
+              <div className="p-10 text-center text-xs text-zinc-500 dark:text-zinc-400">
+                Loading architecture modules...
+              </div>
+            }
+          >
+            <ArchitectureBlueprintView />
+          </Suspense>
+        )}
       </main>
 
       {/* Mobile Fixed Bottom Thumb-Zone Navigation Bar (within 15% sticky height cap) */}

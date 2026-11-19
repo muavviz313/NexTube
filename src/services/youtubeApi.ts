@@ -3,9 +3,32 @@ import type {
   PlaylistSummary,
   SponsorSegment,
   VideoItem,
+  YouTubeChannelResult,
 } from '../types/nextube';
 
 const YT_BASE = 'https://www.googleapis.com/youtube/v3';
+
+// Client-side memory cache & in-flight deduplication for ultra-fast responses
+const memCache = new Map<string, { expiresAt: number; data: unknown }>();
+const inFlight = new Map<string, Promise<unknown>>();
+function cachedFetch<T>(key: string, ttlMs: number, loader: () => Promise<T>): Promise<T> {
+  const hit = memCache.get(key);
+  if (hit && Date.now() < hit.expiresAt) return Promise.resolve(hit.data as T);
+  const running = inFlight.get(key);
+  if (running) return running as Promise<T>;
+  const p = loader()
+    .then((res) => {
+      memCache.set(key, { expiresAt: Date.now() + ttlMs, data: res });
+      inFlight.delete(key);
+      return res;
+    })
+    .catch((err) => {
+      inFlight.delete(key);
+      throw err;
+    });
+  inFlight.set(key, p);
+  return p;
+}
 
 function parseIsoDuration(iso: string): { seconds: number; label: string } {
   const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -52,6 +75,7 @@ function formatRelativeDate(iso?: string): string {
 async function ytFetch<T>(path: string, token: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${YT_BASE}${path}`, {
     ...init,
+    signal: init?.signal ?? AbortSignal.timeout(3500),
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
@@ -182,50 +206,206 @@ export interface LiveVideoDetails {
 export async function fetchLiveYouTubeVideoDetails(
   youtubeId: string
 ): Promise<LiveVideoDetails | null> {
-  try {
-    const res = await fetch(`/api/youtube/details?videoId=${encodeURIComponent(youtubeId)}`);
-    if (!res.ok) return null;
-    return (await res.json()) as LiveVideoDetails;
-  } catch {
-    return null;
-  }
+  return cachedFetch(`details:${youtubeId}`, 600_000, async () => {
+    try {
+      const res = await fetch(`/api/youtube/details?videoId=${encodeURIComponent(youtubeId)}`);
+      if (!res.ok) return null;
+      return (await res.json()) as LiveVideoDetails;
+    } catch {
+      return null;
+    }
+  });
 }
 
 export async function fetchLiveYouTubeFallback(
   query: string,
   type: 'videos' | 'shorts' = 'videos',
-  categoryLabel = 'YouTube'
+  categoryLabel = 'YouTube',
+  sortBy: 'latest' | 'relevance' = 'relevance'
 ): Promise<VideoItem[]> {
-  const res = await fetch(
-    `/api/youtube/live?q=${encodeURIComponent(query || 'trending')}&type=${type}`
-  );
-  if (!res.ok) return [];
-  const data = (await res.json()) as { items?: LiveFallbackItem[] };
-  return (data.items || []).map((item) => ({
-    id: item.id,
-    youtubeId: item.youtubeId,
-    title: item.title,
-    description: item.description,
-    channelId: item.channelId,
-    channelTitle: item.channelTitle,
-    channelSubscribers: 'YouTube Creator',
-    isSubscribed: false,
-    isCreatorOwned: false,
-    thumbnailUrl: item.thumbnailUrl,
-    streamUrl: '',
-    durationSeconds: item.durationSeconds,
-    durationLabel: item.durationLabel,
-    viewCountLabel: item.viewCountLabel,
-    publishedAtLabel: item.publishedAtLabel,
-    category: categoryLabel,
-    likeCount: 0,
-    isLiked: false,
-    isShort: item.isShort || type === 'shorts',
-    maxQualityLabel: '1080p HD',
-    sponsorSegments: [],
-    subtitles: [],
-    source: 'youtube' as const,
+  const normalized = (query || 'trending').trim().toLowerCase();
+  const sortParam = sortBy === 'latest' && type === 'videos' ? 'date' : 'relevance';
+  return cachedFetch(`live:${type}:${sortParam}:${normalized}:${categoryLabel}`, 180_000, async () => {
+    const res = await fetch(
+      `/api/youtube/live?q=${encodeURIComponent(query || 'trending')}&type=${type}&sort=${sortParam}`
+    );
+    if (!res.ok) return [];
+    const data = (await res.json()) as { items?: LiveFallbackItem[] };
+    return (data.items || []).map((item) => ({
+      id: item.id,
+      youtubeId: item.youtubeId,
+      title: item.title,
+      description: item.description,
+      channelId: item.channelId,
+      channelTitle: item.channelTitle,
+      channelSubscribers: 'YouTube Creator',
+      isSubscribed: false,
+      isCreatorOwned: false,
+      thumbnailUrl: item.thumbnailUrl,
+      streamUrl: '',
+      durationSeconds: item.durationSeconds,
+      durationLabel: item.durationLabel,
+      viewCountLabel: item.viewCountLabel,
+      publishedAtLabel: item.publishedAtLabel,
+      category: categoryLabel,
+      likeCount: 0,
+      isLiked: false,
+      isShort: item.isShort || type === 'shorts',
+      maxQualityLabel: '1080p HD',
+      sponsorSegments: [],
+      subtitles: [],
+      source: 'youtube' as const,
+    }));
+  });
+}
+
+export async function searchYouTubeChannels(
+  query: string,
+  token?: string | null,
+  subscribedChannelIds: Set<string> = new Set()
+): Promise<YouTubeChannelResult[]> {
+  const q = query.trim() || 'tech';
+  const results = await cachedFetch(`channels:${q.toLowerCase()}`, 180_000, async () => {
+    if (token) {
+      try {
+        const searchRes = await ytFetch<
+          YtListResponse<{
+            id: { channelId?: string };
+            snippet: {
+              title: string;
+              description: string;
+              thumbnails: { high?: { url: string }; medium?: { url: string }; default?: { url: string } };
+            };
+          }>
+        >(`/search?part=snippet&type=channel&maxResults=15&q=${encodeURIComponent(q)}`, token);
+
+        const ids = (searchRes.items || [])
+          .map((it) => it.id.channelId)
+          .filter((id): id is string => Boolean(id));
+
+        if (ids.length > 0) {
+          const statsRes = await ytFetch<
+            YtListResponse<{
+              id: string;
+              snippet: {
+                title: string;
+                customUrl?: string;
+                description: string;
+                thumbnails: { high?: { url: string }; medium?: { url: string }; default?: { url: string } };
+              };
+              statistics?: { subscriberCount?: string };
+            }>
+          >(
+            `/channels?part=snippet,statistics&id=${encodeURIComponent(ids.join(','))}`,
+            token
+          );
+
+          if ((statsRes.items || []).length > 0) {
+            return (statsRes.items || []).map((c) => ({
+              channelId: c.id,
+              title: c.snippet.title,
+              handle: c.snippet.customUrl || '',
+              thumbnailUrl:
+                c.snippet.thumbnails.high?.url ||
+                c.snippet.thumbnails.medium?.url ||
+                c.snippet.thumbnails.default?.url ||
+                '',
+              subscriberCountLabel: c.statistics?.subscriberCount
+                ? formatCompactSubscribers(c.statistics.subscriberCount)
+                : 'YouTube Channel',
+              description: c.snippet.description || '',
+            }));
+          }
+        }
+      } catch {
+        // Fallback to live channel parser
+      }
+    }
+
+    const res = await fetch(`/api/youtube/channels?q=${encodeURIComponent(q)}`);
+    if (!res.ok) return [];
+    const data = (await res.json()) as { channels?: YouTubeChannelResult[] };
+    return data.channels || [];
+  });
+
+  return results.map((ch) => ({
+    ...ch,
+    isSubscribed: subscribedChannelIds.has(ch.channelId),
   }));
+}
+
+export async function fetchChannelUploads(
+  channel: { channelId: string; title: string; thumbnailUrl?: string },
+  token?: string | null,
+  myChannelId?: string,
+  subscribedChannelIds: Set<string> = new Set()
+): Promise<VideoItem[]> {
+  return cachedFetch(`chanvids:${channel.channelId}`, 180_000, async () => {
+    if (token) {
+      try {
+        const chInfo = await ytFetch<
+          YtListResponse<{ contentDetails?: { relatedPlaylists?: { uploads?: string } } }>
+        >(`/channels?part=contentDetails&id=${encodeURIComponent(channel.channelId)}`, token);
+        const uploadsId = chInfo.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+        if (uploadsId) {
+          const plItems = await ytFetch<YtListResponse<{ contentDetails?: { videoId?: string } }>>(
+            `/playlistItems?part=contentDetails&playlistId=${encodeURIComponent(uploadsId)}&maxResults=18`,
+            token
+          );
+          const vids = (plItems.items || [])
+            .map((it) => it.contentDetails?.videoId)
+            .filter((id): id is string => Boolean(id));
+          if (vids.length > 0) {
+            const hydrated = await fetchYouTubeVideosByIds(vids, token, {
+              myChannelId,
+              subscribedChannelIds,
+              categoryLabel: channel.title,
+            });
+            if (hydrated.length > 0) return hydrated;
+          }
+        }
+      } catch {
+        // Fallback to live channel uploads HTML endpoint
+      }
+    }
+
+    const res = await fetch(
+      `/api/youtube/channel-videos?channelId=${encodeURIComponent(
+        channel.channelId
+      )}&channelTitle=${encodeURIComponent(channel.title)}`
+    );
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      items?: Array<LiveFallbackItem & { channelAvatarUrl?: string }>;
+    };
+    const isSub = subscribedChannelIds.has(channel.channelId);
+    return (data.items || []).map((item) => ({
+      id: item.id,
+      youtubeId: item.youtubeId,
+      title: item.title,
+      description: item.description,
+      channelId: item.channelId,
+      channelTitle: item.channelTitle || channel.title,
+      channelAvatarUrl: item.channelAvatarUrl || channel.thumbnailUrl,
+      channelSubscribers: 'YouTube Channel',
+      isSubscribed: isSub,
+      isCreatorOwned: false,
+      thumbnailUrl: item.thumbnailUrl,
+      streamUrl: '',
+      durationSeconds: item.durationSeconds,
+      durationLabel: item.durationLabel,
+      viewCountLabel: item.viewCountLabel,
+      publishedAtLabel: item.publishedAtLabel,
+      category: channel.title,
+      likeCount: 0,
+      isLiked: false,
+      isShort: item.isShort,
+      maxQualityLabel: '1080p HD',
+      sponsorSegments: [],
+      subtitles: [],
+      source: 'youtube' as const,
+    }));
+  });
 }
 
 export async function fetchYouTubeVideosByIds(
@@ -416,74 +596,48 @@ export async function fetchYouTubeSyncBundle(
     }
   }
 
-  // Live real YouTube fallback + personalized interest feeds
-  if (interestQueries.length > 0) {
-    const interestBatches = await Promise.allSettled(
-      interestQueries.slice(0, 2).map((q) => fetchLiveYouTubeFallback(q, 'videos', 'For You'))
-    );
-    const interestShortsBatches = await Promise.allSettled(
-      interestQueries.slice(0, 1).map((q) => fetchLiveYouTubeFallback(q, 'shorts', 'Shorts'))
-    );
-    for (const r of interestBatches) {
-      if (r.status === 'fulfilled') {
-        for (const v of r.value) {
-          if (!seenHome.has(v.id)) {
-            seenHome.add(v.id);
-            homeVideos.unshift({ ...v, isLiked: likedIdSet.has(v.id) });
-          }
+  // Run personalized interest + fallback fetches in parallel so Home & Shorts render immediately
+  const [liveHomeFallback, liveShortsFallback, interestVideoRes, interestShortsRes] =
+    await Promise.all([
+      homeVideos.length === 0
+        ? fetchLiveYouTubeFallback('trending 4k videos music tech', 'videos', 'YouTube')
+        : Promise.resolve([]),
+      shortsVideos.length === 0
+        ? fetchLiveYouTubeFallback('trending', 'shorts', 'Shorts')
+        : Promise.resolve([]),
+      interestQueries.length > 0
+        ? Promise.allSettled(
+            interestQueries.slice(0, 2).map((q) => fetchLiveYouTubeFallback(q, 'videos', 'For You'))
+          )
+        : Promise.resolve([]),
+      interestQueries.length > 0
+        ? fetchLiveYouTubeFallback(interestQueries[0], 'shorts', 'Shorts')
+        : Promise.resolve([]),
+    ]);
+
+  for (const r of interestVideoRes) {
+    if (r.status === 'fulfilled') {
+      for (const v of r.value) {
+        if (!seenHome.has(v.id)) {
+          seenHome.add(v.id);
+          homeVideos.unshift({ ...v, isLiked: likedIdSet.has(v.id) });
         }
       }
     }
-    for (const r of interestShortsBatches) {
-      if (r.status === 'fulfilled') {
-        const existingShortIds = new Set(shortsVideos.map((s) => s.id));
-        shortsVideos = [
-          ...r.value.filter((s) => !existingShortIds.has(s.id)),
-          ...shortsVideos,
-        ];
-      }
-    }
   }
-
-  if (homeVideos.length === 0) {
-    const liveHome = await fetchLiveYouTubeFallback('trending 4k videos music tech', 'videos', 'YouTube');
-    homeVideos.push(...liveHome);
+  if (interestShortsRes.length > 0) {
+    const existingShortIds = new Set(shortsVideos.map((s) => s.id));
+    shortsVideos = [
+      ...interestShortsRes.filter((s) => !existingShortIds.has(s.id)),
+      ...shortsVideos,
+    ];
   }
-  if (shortsVideos.length === 0) {
-    const liveShorts = await fetchLiveYouTubeFallback('trending', 'shorts', 'Shorts');
-    shortsVideos.push(...liveShorts);
+  if (homeVideos.length === 0 && liveHomeFallback.length > 0) {
+    homeVideos.push(...liveHomeFallback);
   }
-
-  // Enrich initial top videos & top Shorts with real likeCount, channelTitle, subscribers, avatar & commentCount
-  const toEnrich = [...shortsVideos.slice(0, 4), ...homeVideos.slice(0, 4)];
-  const detailsMap = new Map<string, LiveVideoDetails>();
-  await Promise.allSettled(
-    toEnrich.map(async (item) => {
-      if (!item.youtubeId) return;
-      const d = await fetchLiveYouTubeVideoDetails(item.youtubeId);
-      if (d) detailsMap.set(item.youtubeId, d);
-    })
-  );
-
-  const applyDetails = (v: VideoItem): VideoItem => {
-    const d = v.youtubeId ? detailsMap.get(v.youtubeId) : undefined;
-    if (!d) return v;
-    return {
-      ...v,
-      likeCount: d.likeCount || v.likeCount,
-      channelTitle: d.channelTitle || v.channelTitle,
-      channelSubscribers: d.channelSubscribers || v.channelSubscribers,
-      channelAvatarUrl: d.channelAvatarUrl || v.channelAvatarUrl,
-      description: d.description || v.description,
-      commentCount: d.commentCount ?? v.commentCount,
-      commentCountLabel: d.commentCountLabel || v.commentCountLabel,
-    };
-  };
-
-  for (let i = 0; i < homeVideos.length; i++) {
-    homeVideos[i] = applyDetails(homeVideos[i]);
+  if (shortsVideos.length === 0 && liveShortsFallback.length > 0) {
+    shortsVideos.push(...liveShortsFallback);
   }
-  shortsVideos = shortsVideos.map(applyDetails);
 
   // Hydrate real playlists and their actual playlistItems
   const rawPlaylists =
@@ -552,8 +706,10 @@ export async function searchYouTubeVideos(
     categoryLabel?: string;
     myChannelId?: string;
     subscribedChannelIds?: Set<string>;
+    sortBy?: 'latest' | 'relevance';
   } = {}
 ): Promise<VideoItem[]> {
+  const sortMode = options.sortBy ?? (query.trim() ? 'latest' : 'relevance');
   try {
     if (!query.trim() && options.categoryId) {
       const res = await ytFetch<YtListResponse<YtVideoResource>>(
@@ -572,6 +728,9 @@ export async function searchYouTubeVideos(
       maxResults: '15',
       q: query.trim() || options.categoryLabel || 'trending',
     });
+    if (sortMode === 'latest') {
+      params.set('order', 'date');
+    }
     if (options.categoryId) {
       params.set('videoCategoryId', options.categoryId);
     }
@@ -594,7 +753,12 @@ export async function searchYouTubeVideos(
     [query.trim(), options.categoryLabel && options.categoryLabel !== 'All' ? options.categoryLabel : '']
       .filter(Boolean)
       .join(' ') || 'trending';
-  return fetchLiveYouTubeFallback(fallbackQuery, 'videos', options.categoryLabel || 'YouTube');
+  return fetchLiveYouTubeFallback(
+    fallbackQuery,
+    'videos',
+    options.categoryLabel || 'YouTube',
+    sortMode
+  );
 }
 
 export async function fetchChannelSubscriberLabel(

@@ -11,6 +11,25 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
+// Ultra-fast bounded TTL cache for YouTube metadata, searches & translations
+const apiCache = new Map<string, { expiresAt: number; payload: unknown }>();
+function getCached<T>(key: string): T | null {
+  const entry = apiCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    apiCache.delete(key);
+    return null;
+  }
+  return entry.payload as T;
+}
+function setCached(key: string, payload: unknown, ttlMs = 300_000): void {
+  if (apiCache.size > 300) {
+    const oldestKey = apiCache.keys().next().value;
+    if (oldestKey) apiCache.delete(oldestKey);
+  }
+  apiCache.set(key, { expiresAt: Date.now() + ttlMs, payload });
+}
+
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
   httpOptions: {
@@ -48,6 +67,12 @@ async function startServer() {
       }
 
       const trimmedTexts = texts.slice(0, 40).map((t) => String(t ?? '').slice(0, 2000));
+      const translateCacheKey = `tr:${targetLanguageCode || targetLanguage}:${JSON.stringify(trimmedTexts)}`;
+      const cachedTr = getCached<{ translations: string[]; targetLanguage: string; targetLanguageCode?: string }>(translateCacheKey);
+      if (cachedTr) {
+        res.json(cachedTr);
+        return;
+      }
 
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
@@ -83,11 +108,13 @@ async function startServer() {
         return;
       }
 
-      res.json({
+      const resultPayload = {
         translations: parsed.translations,
         targetLanguage,
         targetLanguageCode,
-      });
+      };
+      setCached(translateCacheKey, resultPayload, 900_000);
+      res.json(resultPayload);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Translation failed';
       console.error('Translation API error:', message);
@@ -179,12 +206,24 @@ async function startServer() {
     try {
       const q = typeof req.query.q === 'string' && req.query.q.trim() ? req.query.q.trim() : 'trending';
       const type = req.query.type === 'shorts' ? 'shorts' : 'videos';
+      const sort = req.query.sort === 'date' ? 'date' : 'relevance';
+      const cacheKey = `live:${type}:${sort}:${q.toLowerCase()}`;
+      const cached = getCached<{ items: unknown[] }>(cacheKey);
+      if (cached) {
+        res.setHeader('Cache-Control', 'public, max-age=180');
+        res.json(cached);
+        return;
+      }
+
       const searchUrl =
         type === 'shorts'
           ? `https://www.youtube.com/results?search_query=${encodeURIComponent(`${q} shorts`)}`
+          : sort === 'date'
+          ? `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&sp=CAI%3D`
           : `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
 
       const ytRes = await fetch(searchUrl, {
+        signal: AbortSignal.timeout(6500),
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -326,9 +365,306 @@ async function startServer() {
       };
 
       walk(data);
-      res.json({ items: items.slice(0, 18) });
+      const parseAgeSec = (lbl: string): number => {
+        const lower = (lbl || '').toLowerCase();
+        if (lower.includes('just now') || lower === 'live') return 0;
+        const m = lower.match(
+          /(\d+)\s*(years?|yrs?|y|months?|mos?|mo|weeks?|wks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/
+        );
+        if (!m) return Number.MAX_SAFE_INTEGER;
+        const n = Number(m[1]);
+        const u = m[2];
+        if (u.startsWith('s')) return n;
+        if (u.startsWith('mo')) return n * 2_592_000;
+        if (u.startsWith('m')) return n * 60;
+        if (u.startsWith('h')) return n * 3_600;
+        if (u.startsWith('d')) return n * 86_400;
+        if (u.startsWith('w')) return n * 604_800;
+        if (u.startsWith('y')) return n * 31_536_000;
+        return Number.MAX_SAFE_INTEGER;
+      };
+      const finalItems =
+        sort === 'date'
+          ? [...items].sort((a, b) => parseAgeSec(a.publishedAtLabel) - parseAgeSec(b.publishedAtLabel))
+          : items;
+      const payload = { items: finalItems.slice(0, 18) };
+      setCached(cacheKey, payload, 300_000);
+      res.setHeader('Cache-Control', 'public, max-age=180');
+      res.json(payload);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to load YouTube feed';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // Live YouTube Channels search endpoint
+  app.get('/api/youtube/channels', async (req, res) => {
+    try {
+      const q = typeof req.query.q === 'string' && req.query.q.trim() ? req.query.q.trim() : 'tech';
+      const cacheKey = `channels:${q.toLowerCase()}`;
+      const cached = getCached<{ channels: unknown[] }>(cacheKey);
+      if (cached) {
+        res.setHeader('Cache-Control', 'public, max-age=180');
+        res.json(cached);
+        return;
+      }
+
+      const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&sp=EgIQAg%3D%3D`;
+
+      const ytRes = await fetch(searchUrl, {
+        signal: AbortSignal.timeout(6500),
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+
+      if (!ytRes.ok) {
+        res.status(ytRes.status).json({ error: `YouTube returned HTTP ${ytRes.status}` });
+        return;
+      }
+
+      const html = await ytRes.text();
+      const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/);
+      if (!match) {
+        res.json({ channels: [] });
+        return;
+      }
+
+      const data = JSON.parse(match[1]) as unknown;
+      const channels: Array<{
+        channelId: string;
+        title: string;
+        handle: string;
+        thumbnailUrl: string;
+        subscriberCountLabel: string;
+        description: string;
+      }> = [];
+      const seen = new Set<string>();
+
+      const walk = (node: unknown) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) {
+          for (const child of node) walk(child);
+          return;
+        }
+        const obj = node as Record<string, unknown>;
+        if (obj.channelRenderer && typeof obj.channelRenderer === 'object') {
+          const c = obj.channelRenderer as Record<string, any>;
+          const channelId = typeof c.channelId === 'string' ? c.channelId : '';
+          if (channelId && !seen.has(channelId)) {
+            seen.add(channelId);
+            const title =
+              c.title?.simpleText ||
+              c.title?.runs?.map((r: any) => r.text).join('') ||
+              'YouTube Channel';
+            const handleRaw =
+              c.subscriberCountText?.simpleText ||
+              c.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl?.replace(/^\//, '') ||
+              '';
+            const subsRaw = c.videoCountText?.simpleText || 'YouTube Channel';
+            const description =
+              c.descriptionSnippet?.runs?.map((r: any) => r.text).join('') || '';
+            const thumbs = c.thumbnail?.thumbnails;
+            const rawThumb =
+              (Array.isArray(thumbs) && thumbs.length > 0 && thumbs[thumbs.length - 1]?.url) || '';
+            const thumbnailUrl = rawThumb.startsWith('//') ? `https:${rawThumb}` : rawThumb;
+
+            channels.push({
+              channelId,
+              title,
+              handle: handleRaw,
+              thumbnailUrl,
+              subscriberCountLabel: subsRaw,
+              description,
+            });
+          }
+        }
+        for (const val of Object.values(obj)) {
+          walk(val);
+        }
+      };
+
+      walk(data);
+      const chPayload = { channels: channels.slice(0, 18) };
+      setCached(cacheKey, chPayload, 300_000);
+      res.setHeader('Cache-Control', 'public, max-age=180');
+      res.json(chPayload);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to search YouTube channels';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // Fetch real uploads from a specific YouTube channel
+  app.get('/api/youtube/channel-videos', async (req, res) => {
+    try {
+      const channelId = typeof req.query.channelId === 'string' ? req.query.channelId.trim() : '';
+      const fallbackChannelTitle =
+        typeof req.query.channelTitle === 'string' && req.query.channelTitle.trim()
+          ? req.query.channelTitle.trim()
+          : 'YouTube Creator';
+      if (!channelId || !/^[a-zA-Z0-9_-]{6,40}$/.test(channelId)) {
+        res.status(400).json({ error: 'Valid channelId is required' });
+        return;
+      }
+
+      const cacheKey = `chanvids:${channelId}`;
+      const cached = getCached<{ items: unknown[] }>(cacheKey);
+      if (cached) {
+        res.setHeader('Cache-Control', 'public, max-age=180');
+        res.json(cached);
+        return;
+      }
+
+      const chanRes = await fetch(
+        `https://www.youtube.com/channel/${encodeURIComponent(channelId)}/videos`,
+        {
+          signal: AbortSignal.timeout(6500),
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        }
+      );
+
+      if (!chanRes.ok) {
+        res.status(chanRes.status).json({ error: `YouTube returned HTTP ${chanRes.status}` });
+        return;
+      }
+
+      const html = await chanRes.text();
+      const match = html.match(/var ytInitialData = (\{.*?\});<\/script>/);
+      if (!match) {
+        res.json({ items: [] });
+        return;
+      }
+
+      const data = JSON.parse(match[1]) as Record<string, any>;
+      const resolvedChannelTitle =
+        data?.metadata?.channelMetadataRenderer?.title || fallbackChannelTitle;
+      const resolvedAvatarRaw =
+        data?.metadata?.channelMetadataRenderer?.avatar?.thumbnails?.[0]?.url || '';
+      const resolvedAvatarUrl = resolvedAvatarRaw.startsWith('//')
+        ? `https:${resolvedAvatarRaw}`
+        : resolvedAvatarRaw;
+
+      const items: Array<{
+        id: string;
+        youtubeId: string;
+        title: string;
+        description: string;
+        channelId: string;
+        channelTitle: string;
+        channelAvatarUrl?: string;
+        thumbnailUrl: string;
+        durationLabel: string;
+        durationSeconds: number;
+        viewCountLabel: string;
+        publishedAtLabel: string;
+        isShort: boolean;
+      }> = [];
+      const seen = new Set<string>();
+
+      const parseDurationLabel = (lbl: string): number => {
+        const parts = lbl.split(':').map(Number);
+        if (parts.some(Number.isNaN)) return 300;
+        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        if (parts.length === 2) return parts[0] * 60 + parts[1];
+        return parts[0] || 60;
+      };
+
+      const walk = (node: unknown) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) {
+          for (const child of node) walk(child);
+          return;
+        }
+        const obj = node as Record<string, unknown>;
+        if (obj.lockupViewModel && typeof obj.lockupViewModel === 'object') {
+          const lv = obj.lockupViewModel as Record<string, any>;
+          const videoId = typeof lv.contentId === 'string' ? lv.contentId : '';
+          if (videoId && !seen.has(videoId)) {
+            seen.add(videoId);
+            const title = lv.metadata?.lockupMetadataViewModel?.title?.content || 'YouTube Video';
+            const parts =
+              lv.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel
+                ?.metadataRows?.[0]?.metadataParts || [];
+            const viewPart = parts[0]?.text?.content || 'YouTube';
+            const publishedPart = parts[1]?.text?.content || 'Recent';
+            const badges =
+              lv.contentImage?.thumbnailViewModel?.overlays?.[0]?.thumbnailBottomOverlayViewModel
+                ?.badges || [];
+            const durationLabel = badges[0]?.thumbnailBadgeViewModel?.text || '6:00';
+            const durationSeconds = parseDurationLabel(durationLabel);
+            const sources = lv.contentImage?.thumbnailViewModel?.image?.sources || [];
+            const rawThumb =
+              (Array.isArray(sources) && sources.length > 0 && sources[sources.length - 1]?.url) ||
+              `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+
+            items.push({
+              id: videoId,
+              youtubeId: videoId,
+              title,
+              description: '',
+              channelId,
+              channelTitle: resolvedChannelTitle,
+              channelAvatarUrl: resolvedAvatarUrl || undefined,
+              thumbnailUrl: rawThumb.startsWith('//') ? `https:${rawThumb}` : rawThumb,
+              durationLabel,
+              durationSeconds,
+              viewCountLabel: viewPart.includes('view') ? viewPart : `${viewPart} views`,
+              publishedAtLabel: publishedPart,
+              isShort: durationSeconds <= 60,
+            });
+          }
+        }
+        if (obj.videoRenderer && typeof obj.videoRenderer === 'object') {
+          const v = obj.videoRenderer as Record<string, any>;
+          const videoId = typeof v.videoId === 'string' ? v.videoId : '';
+          if (videoId && !seen.has(videoId)) {
+            seen.add(videoId);
+            const title = v.title?.runs?.map((r: any) => r.text).join('') || 'YouTube Video';
+            const durationLabel = v.lengthText?.simpleText || '5:00';
+            const durationSeconds = parseDurationLabel(durationLabel);
+            const viewRaw = v.shortViewCountText?.simpleText || 'YouTube';
+            const publishedAtLabel = v.publishedTimeText?.simpleText || 'Recent';
+            const thumbs = v.thumbnail?.thumbnails;
+            const rawThumb =
+              (Array.isArray(thumbs) && thumbs.length > 0 && thumbs[thumbs.length - 1]?.url) ||
+              `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+
+            items.push({
+              id: videoId,
+              youtubeId: videoId,
+              title,
+              description: '',
+              channelId,
+              channelTitle: resolvedChannelTitle,
+              channelAvatarUrl: resolvedAvatarUrl || undefined,
+              thumbnailUrl: rawThumb.startsWith('//') ? `https:${rawThumb}` : rawThumb,
+              durationLabel,
+              durationSeconds,
+              viewCountLabel: viewRaw.includes('view') ? viewRaw : `${viewRaw} views`,
+              publishedAtLabel,
+              isShort: durationSeconds <= 60,
+            });
+          }
+        }
+        for (const val of Object.values(obj)) {
+          walk(val);
+        }
+      };
+
+      walk(data);
+      const chanPayload = { items: items.slice(0, 24) };
+      setCached(cacheKey, chanPayload, 300_000);
+      res.setHeader('Cache-Control', 'public, max-age=180');
+      res.json(chanPayload);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to load channel videos';
       res.status(500).json({ error: message });
     }
   });
@@ -342,7 +678,16 @@ async function startServer() {
         return;
       }
 
+      const detailsKey = `details:${videoId}`;
+      const cachedDetails = getCached<Record<string, unknown>>(detailsKey);
+      if (cachedDetails) {
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        res.json(cachedDetails);
+        return;
+      }
+
       const watchRes = await fetch(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {
+        signal: AbortSignal.timeout(6500),
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -485,7 +830,7 @@ async function startServer() {
         }
       }
 
-      res.json({
+      const detailsPayload = {
         videoId,
         likeCount,
         channelSubscribers,
@@ -495,7 +840,10 @@ async function startServer() {
         commentCount,
         commentCountLabel,
         comments,
-      });
+      };
+      setCached(detailsKey, detailsPayload, 600_000);
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.json(detailsPayload);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to load YouTube details';
       res.status(500).json({ error: message });
@@ -599,6 +947,12 @@ export class ErrorOverlay extends HTMLElement {}
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`NexTube server running on http://0.0.0.0:${PORT}`);
+    // Pre-warm live YouTube Home & Shorts cache in background for instant first paint
+    const base = `http://127.0.0.1:${PORT}`;
+    void Promise.allSettled([
+      fetch(`${base}/api/youtube/live?type=videos&q=trending%204k%20videos%20music%20tech`),
+      fetch(`${base}/api/youtube/live?type=shorts&q=trending`),
+    ]);
   });
 }
 
