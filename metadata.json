@@ -1,0 +1,6 @@
+{
+  "name": "NexTube",
+  "description": "High-performance video streaming client with Google OAuth YouTube Data API v3 sync, gesture-controlled 4K player, offline playlist & gallery downloads, SponsorBlock, comment moderation, and 100+ language AI translation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
